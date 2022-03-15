@@ -39,15 +39,12 @@ func ProtoBatchesToInternalTraces(batches []*model.Batch) pdata.Traces {
 		return traceData
 	}
 
-	rss := traceData.ResourceSpans()
-	rss.EnsureCapacity(len(batches))
-
 	for _, batch := range batches {
-		if batch.GetProcess() == nil && len(batch.GetSpans()) == 0 {
+		if len(batch.GetSpans()) == 0 {
 			continue
 		}
 
-		protoBatchToResourceSpans(*batch, rss.AppendEmpty())
+		protoBatchToResourceSpans(*batch, traceData)
 	}
 
 	return traceData
@@ -57,34 +54,21 @@ func ProtoBatchesToInternalTraces(batches []*model.Batch) pdata.Traces {
 func ProtoBatchToInternalTraces(batch model.Batch) pdata.Traces {
 	traceData := pdata.NewTraces()
 
-	if batch.GetProcess() == nil && len(batch.GetSpans()) == 0 {
+	if len(batch.GetSpans()) == 0 {
 		return traceData
 	}
 
-	protoBatchToResourceSpans(batch, traceData.ResourceSpans().AppendEmpty())
+	protoBatchToResourceSpans(batch, traceData)
 
 	return traceData
 }
 
-func protoBatchToResourceSpans(batch model.Batch, dest pdata.ResourceSpans) {
-	jSpans := batch.GetSpans()
-
-	jProcessToInternalResource(batch.GetProcess(), dest.Resource())
-
-	if len(jSpans) == 0 {
+func protoBatchToResourceSpans(batch model.Batch, dest pdata.Traces) {
+	if len(batch.GetSpans()) == 0 {
 		return
 	}
 
-	groupByLibrary := jSpansToInternal(jSpans)
-	ilss := dest.InstrumentationLibrarySpans()
-	for library, spans := range groupByLibrary {
-		ils := ilss.AppendEmpty()
-		if library.name != "" {
-			ils.InstrumentationLibrary().SetName(library.name)
-			ils.InstrumentationLibrary().SetVersion(library.version)
-		}
-		spans.MoveAndAppendTo(ils.Spans())
-	}
+	jSpansToInternal(batch, dest)
 }
 
 func jProcessToInternalResource(process *model.Process, dest pdata.Resource) {
@@ -133,31 +117,34 @@ func translateJaegerVersionAttr(attrs pdata.AttributeMap) {
 	}
 }
 
-func jSpansToInternal(spans []*model.Span) map[instrumentationLibrary]pdata.SpanSlice {
-	spansByLibrary := make(map[instrumentationLibrary]pdata.SpanSlice)
-
-	for _, span := range spans {
+func jSpansToInternal(batch model.Batch, traces pdata.Traces) {
+	defaultProcess := batch.GetProcess()
+	for _, span := range batch.GetSpans() {
 		if span == nil || reflect.DeepEqual(span, blankJaegerProtoSpan) {
 			continue
 		}
-		jSpanToInternal(span, spansByLibrary)
+		jSpanToInternal(span, defaultProcess, traces)
 	}
-	return spansByLibrary
 }
 
 type instrumentationLibrary struct {
 	name, version string
 }
 
-func jSpanToInternal(span *model.Span, spansByLibrary map[instrumentationLibrary]pdata.SpanSlice) {
-	il := getInstrumentationLibrary(span)
-	ss, found := spansByLibrary[il]
-	if !found {
-		ss = pdata.NewSpanSlice()
-		spansByLibrary[il] = ss
+func jSpanToInternal(span *model.Span, defaultProcess *model.Process, traces pdata.Traces) {
+	spanProcess := span.GetProcess()
+	if spanProcess == nil {
+		spanProcess = defaultProcess
 	}
 
-	dest := ss.AppendEmpty()
+	rs := traces.ResourceSpans().AppendEmpty()
+	jProcessToInternalResource(spanProcess, rs.Resource())
+
+	ils := rs.InstrumentationLibrarySpans()
+	ilss := ils.AppendEmpty()
+	jInstrumentationLibraryToOtel(span, ilss.InstrumentationLibrary())
+
+	dest := ilss.Spans().AppendEmpty()
 	dest.SetTraceID(idutils.UInt64ToTraceID(span.TraceID.High, span.TraceID.Low))
 	dest.SetSpanID(idutils.UInt64ToSpanID(uint64(span.SpanID)))
 	dest.SetName(span.OperationName)
@@ -387,15 +374,13 @@ func getTraceStateFromAttrs(attrs pdata.AttributeMap) pdata.TraceState {
 	return traceState
 }
 
-func getInstrumentationLibrary(span *model.Span) instrumentationLibrary {
-	il := instrumentationLibrary{}
+func jInstrumentationLibraryToOtel(span *model.Span, library pdata.InstrumentationLibrary) {
 	if libraryName, ok := getAndDeleteTag(span, conventions.InstrumentationLibraryName); ok {
-		il.name = libraryName
+		library.SetName(libraryName)
 		if libraryVersion, ok := getAndDeleteTag(span, conventions.InstrumentationLibraryVersion); ok {
-			il.version = libraryVersion
+			library.SetVersion(libraryVersion)
 		}
 	}
-	return il
 }
 
 func getAndDeleteTag(span *model.Span, key string) (string, bool) {
